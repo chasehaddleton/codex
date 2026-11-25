@@ -257,7 +257,10 @@ impl PathWatchCounts {
 }
 
 struct FileWatcherInner {
+    #[cfg(not(target_os = "macos"))]
     watcher: RecommendedWatcher,
+    #[cfg(target_os = "macos")]
+    watcher: MacNativeWatcher,
     watched_paths: HashMap<PathBuf, RecursiveMode>,
     #[cfg(target_os = "macos")]
     ancestors: HashMap<PathBuf, vnode::Watch>,
@@ -265,6 +268,76 @@ struct FileWatcherInner {
     roots: HashMap<PathBuf, vnode::Watch>,
     #[cfg(target_os = "macos")]
     raw_tx: mpsc::UnboundedSender<BackendEvent>,
+}
+
+#[cfg(target_os = "macos")]
+struct MacNativeWatcher {
+    inner: RecommendedWatcher,
+    // A symlink can resolve elsewhere by the time notify is asked to unwatch it.
+    // Register canonical paths and retain the spelling owned by each caller.
+    bindings: HashMap<PathBuf, (PathBuf, RecursiveMode)>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacNativeWatcher {
+    fn mode(&self, target: &Path) -> Option<RecursiveMode> {
+        self.bindings
+            .values()
+            .filter(|(path, _)| path == target)
+            .map(|(_, mode)| *mode)
+            .max_by_key(|m| *m == RecursiveMode::Recursive)
+    }
+
+    fn set_mode(
+        &mut self,
+        target: &Path,
+        before: Option<RecursiveMode>,
+        after: Option<RecursiveMode>,
+    ) -> notify::Result<()> {
+        if before == after {
+            return Ok(());
+        }
+        if before.is_some() {
+            self.inner.unwatch(target)?;
+        }
+        if let Some(mode) = after
+            && let Err(err) = self.inner.watch(target, mode)
+        {
+            if let Some(previous) = before {
+                let _ = self.inner.watch(target, previous);
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        let target = path.canonicalize()?;
+        if let Some((previous, previous_mode)) = self.bindings.get(path) {
+            if *previous == target && *previous_mode == mode {
+                return Ok(());
+            }
+            self.unwatch(path)?;
+        }
+        let before = self.mode(&target);
+        let after = before
+            .filter(|m| *m == RecursiveMode::Recursive)
+            .unwrap_or(mode);
+        self.set_mode(&target, before, Some(after))?;
+        self.bindings.insert(path.to_owned(), (target, mode));
+        Ok(())
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        let Some((target, removed)) = self.bindings.remove(path) else {
+            return Ok(());
+        };
+        let after = self.mode(&target);
+        let before = after
+            .filter(|m| *m == RecursiveMode::Recursive)
+            .unwrap_or(removed);
+        self.set_mode(&target, Some(before), after)
+    }
 }
 
 /// Coalesces bursts of watch notifications and emits at most once per interval.
@@ -444,6 +517,11 @@ impl FileWatcher {
         let watcher = notify::recommended_watcher(move |res| {
             let _ = raw_tx.send(BackendEvent::Native(res));
         })?;
+        #[cfg(target_os = "macos")]
+        let watcher = MacNativeWatcher {
+            inner: watcher,
+            bindings: HashMap::new(),
+        };
         let inner = FileWatcherInner {
             watcher,
             watched_paths: HashMap::new(),
@@ -868,6 +946,14 @@ impl FileWatcher {
                                     continue;
                                 }
                                 if path.exists() {
+                                    if let Some(mode) = guard.watched_paths.get(&path).copied()
+                                        && let Err(err) = guard.watcher.watch(&path, mode)
+                                    {
+                                        warn!("failed to rebind {}: {err}", path.display());
+                                        if !guard.watcher.bindings.contains_key(&path) {
+                                            guard.watched_paths.remove(&path);
+                                        }
+                                    }
                                     Self::watch_root_lifetime(&mut guard, &path);
                                 } else {
                                     guard.roots.remove(&path);

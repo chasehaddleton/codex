@@ -26,6 +26,11 @@ pub(super) enum Location {
 }
 
 pub(super) struct Watch {
+    root: Source,
+    links: Vec<(PathBuf, Source)>,
+}
+
+struct Source {
     source: DispatchRetained<DispatchSource>,
     device: u64,
     inode: u64,
@@ -47,20 +52,50 @@ impl Watch {
             ),
             Location::Root(path) => (path, terminal, 0),
         };
-        let file = File::options()
-            .read(true)
-            .custom_flags(libc::O_EVTONLY | libc::O_NONBLOCK | open_flags)
-            .open(path)
-            .inspect_err(|err| {
-                // The resolved path can disappear before the descriptor is armed.
-                // No source will deliver that change, so reconcile the path once.
+        let open = |entry: &Path, mask, flags| {
+            Source::new(entry, mask, flags, &location, &tx).inspect_err(|err| {
+                // A component can disappear before its descriptor is armed.
                 if matches!(
                     err.kind(),
                     io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
                 ) {
                     let _ = tx.send(BackendEvent::Vanished(path.clone()));
                 }
-            })?;
+            })
+        };
+        let root = open(path, mask, open_flags)?;
+        let mut links = Vec::new();
+        for component in path.ancestors() {
+            if component.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                // Removing a symlink does not change the vnode of its destination.
+                let link = open(component, terminal, libc::O_SYMLINK)?;
+                links.push((component.to_owned(), link));
+            }
+        }
+        Ok(Self { root, links })
+    }
+
+    pub(super) fn still_watches(&self, path: &Path) -> bool {
+        self.root.matches(path.metadata())
+            && self
+                .links
+                .iter()
+                .all(|(p, source)| source.matches(p.symlink_metadata()))
+    }
+}
+
+impl Source {
+    fn new(
+        path: &Path,
+        mask: libc::c_ulong,
+        open_flags: libc::c_int,
+        location: &Location,
+        tx: &mpsc::UnboundedSender<BackendEvent>,
+    ) -> io::Result<Self> {
+        let file = File::options()
+            .read(true)
+            .custom_flags(libc::O_EVTONLY | libc::O_NONBLOCK | open_flags)
+            .open(path)?;
         let metadata = file.metadata()?;
         // SAFETY: the vnode type and mask describe an open file or directory. The
         // cancellation handler retains its descriptor until dispatch is done with it.
@@ -72,6 +107,8 @@ impl Watch {
                 None,
             )
         };
+        let location = location.clone();
+        let tx = tx.clone();
         let changed = RcBlock::new(move || {
             let _ = tx.send(BackendEvent::VnodeChanged(location.clone()));
         });
@@ -94,13 +131,12 @@ impl Watch {
         })
     }
 
-    pub(super) fn still_watches(&self, path: &Path) -> bool {
-        path.metadata()
-            .is_ok_and(|m| m.dev() == self.device && m.ino() == self.inode)
+    fn matches(&self, metadata: io::Result<std::fs::Metadata>) -> bool {
+        metadata.is_ok_and(|m| m.dev() == self.device && m.ino() == self.inode)
     }
 }
 
-impl Drop for Watch {
+impl Drop for Source {
     fn drop(&mut self) {
         self.source.cancel();
     }

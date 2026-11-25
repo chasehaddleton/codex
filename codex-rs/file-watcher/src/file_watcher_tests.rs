@@ -916,8 +916,9 @@ mod macos {
     async fn a_shared_fallback_rechecks_newly_registered_symlink_components()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = tempfile::tempdir()?;
-        let home = fixture.path().join("home");
-        let external = fixture.path().join("external");
+        let root = fixture.path().canonicalize()?;
+        let home = root.join("home");
+        let external = root.join("external");
         fs::create_dir(&home)?;
         fs::create_dir_all(external.join("skills"))?;
         let requested = WatchPath {
@@ -954,6 +955,49 @@ mod macos {
         receive_path(&mut rx, &requested.path, "shared registration").await;
         fs::write(external.join("skills/SKILL.md"), [])?;
         receive_path(&mut rx, &requested.path.join("SKILL.md"), "symlinked child").await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn promoted_root_follows_replacement_of_a_symlink_component()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let home = fixture.path().join("home");
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        fs::create_dir(&home)?;
+        fs::create_dir_all(first.join("skills"))?;
+        fs::create_dir_all(second.join("skills"))?;
+        let link = home.join("alias");
+        let requested = link.join("skills");
+        let watcher = Arc::new(FileWatcher::new()?);
+        let (subscriber, mut rx) = watcher.add_subscriber();
+        let _registration = subscriber.register_path(requested.clone(), /*recursive*/ true);
+
+        let direct_root = first.join("skills");
+        let (direct, mut direct_rx) = watcher.add_subscriber();
+        let _direct = direct.register_path(direct_root.clone(), /*recursive*/ false);
+        symlink(&first, &link)?;
+        receive_path(&mut rx, &requested, "initial symlink").await;
+        fs::write(first.join("skills/before"), [])?;
+        receive_path(&mut rx, &requested.join("before"), "original target").await;
+
+        let replacement = fixture.path().join("replacement");
+        symlink(&second, &replacement)?;
+        fs::rename(&replacement, &link)?;
+        receive_path(&mut rx, &requested, "retarget symlink").await;
+        fs::write(second.join("skills/after"), [])?;
+        receive_path(&mut rx, &requested.join("after"), "new target").await;
+        let original_child = direct_root.join("still-watched");
+        fs::write(&original_child, [])?;
+        receive_path(&mut direct_rx, &original_child, "shared original target").await;
+
+        fs::remove_file(&link)?;
+        receive_path(&mut rx, &requested, "unlink symlink").await;
+        symlink(&first, &link)?;
+        receive_path(&mut rx, &requested, "recreate symlink").await;
+        fs::write(first.join("skills/recreated"), [])?;
+        receive_path(&mut rx, &requested.join("recreated"), "recreated target").await;
         Ok(())
     }
 }
