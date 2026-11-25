@@ -3704,6 +3704,9 @@ dependencies = [
 name = "codex-file-watcher"
 version = "0.0.0"
 dependencies = [
+ "block2",
+ "dispatch2",
+ "libc",
  "notify",
  "pretty_assertions",
  "tempfile",
