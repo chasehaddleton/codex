@@ -17,6 +17,11 @@ notify = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing = { workspace = true, features = ["log"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+dispatch2 = "0.3.0"
+libc = { workspace = true }
+
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }

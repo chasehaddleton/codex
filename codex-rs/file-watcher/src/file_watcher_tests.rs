@@ -585,19 +585,19 @@ async fn spawn_event_loop_filters_non_mutating_events() {
     watcher.spawn_event_loop_for_test(raw_rx);
 
     raw_tx
-        .send(Ok(notify_event(
+        .send(BackendEvent::Native(Ok(notify_event(
             EventKind::Access(AccessKind::Open(AccessMode::Any)),
             vec![path("/tmp/skills/SKILL.md")],
-        )))
+        ))))
         .expect("send access event");
     let blocked = timeout(TEST_THROTTLE_INTERVAL, rx.recv()).await;
     assert_eq!(blocked.is_err(), true);
 
     raw_tx
-        .send(Ok(notify_event(
+        .send(BackendEvent::Native(Ok(notify_event(
             EventKind::Create(CreateKind::File),
             vec![path("/tmp/skills/SKILL.md")],
-        )))
+        ))))
         .expect("send create event");
     let event = timeout(Duration::from_secs(1), rx.recv())
         .await
@@ -720,4 +720,284 @@ fn noop_registration_reports_failure() -> Result<(), Box<dyn std::error::Error>>
     drop(registration);
     assert_eq!(watcher.watch_counts_for_test(directory.path()), None);
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    fn backends(watcher: &FileWatcher, path: &Path) -> (bool, Option<RecursiveMode>) {
+        let inner = watcher
+            .inner
+            .as_ref()
+            .expect("live watcher")
+            .lock()
+            .expect("watch lock");
+        (
+            inner.ancestors.contains_key(path),
+            inner.watched_paths.get(path).copied(),
+        )
+    }
+
+    async fn receive_path(rx: &mut Receiver, path: &Path, phase: &str) {
+        timeout(Duration::from_secs(5), async {
+            while let Some(event) = rx.recv().await {
+                if event.paths.iter().any(|changed| changed == path) {
+                    return;
+                }
+            }
+            panic!("watch closed while waiting for {path:?}");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{phase}: timeout waiting for {path:?}"));
+    }
+
+    #[tokio::test]
+    async fn missing_root_watches_only_the_ancestor_vnode_then_the_requested_subtree()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let home = fixture.path().join("home");
+        let build = home.join("cache/build");
+        let requested = home.join(".agents/skills");
+        let staging = fixture.path().join("staging");
+        fs::create_dir_all(&build)?;
+        fs::create_dir_all(staging.join("skills/nested"))?;
+        let watcher = Arc::new(FileWatcher::new()?);
+        let (subscriber, mut rx) = watcher.add_subscriber();
+        let registration = subscriber.register_path(requested.clone(), /*recursive*/ true);
+        assert!(registration.registration_succeeded());
+        // A user-space filter would also suppress subscriber events, but would
+        // still install a recursive-in-practice FSEvents stream on home.
+        assert_eq!(backends(&watcher, &home), (true, None));
+        fs::write(build.join("irrelevant"), [])?;
+        assert!(timeout(TEST_THROTTLE_INTERVAL, rx.recv()).await.is_err());
+
+        fs::rename(&staging, home.join(".agents"))?;
+        receive_path(&mut rx, &requested, "atomic install").await;
+        assert_eq!(backends(&watcher, &home), (false, None));
+        assert_eq!(
+            backends(&watcher, &requested),
+            (false, Some(RecursiveMode::Recursive))
+        );
+        let leaf = requested.join("nested/SKILL.md");
+        fs::write(&leaf, "first")?;
+        receive_path(&mut rx, &leaf, "first child").await;
+
+        fs::remove_dir_all(home.join(".agents"))?;
+        receive_path(&mut rx, &requested, "remove populated ancestor").await;
+        assert_eq!(backends(&watcher, &home), (true, None));
+        fs::create_dir_all(&requested)?;
+        receive_path(&mut rx, &requested, "recreate target").await;
+        fs::remove_dir(&requested)?;
+        receive_path(&mut rx, &requested, "remove empty target").await;
+        fs::create_dir(&requested)?;
+        receive_path(&mut rx, &requested, "recreate empty target").await;
+        let replacement = fixture.path().join("replacement");
+        fs::create_dir(&replacement)?;
+        fs::rename(&replacement, &requested)?;
+        receive_path(&mut rx, &requested, "replace promoted target").await;
+        let recreated = requested.join("new-file");
+        fs::write(&recreated, [])?;
+        receive_path(&mut rx, &recreated, "recreated child").await;
+        drop(registration);
+        assert_eq!(backends(&watcher, &requested), (false, None));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_and_missing_watches_share_the_strongest_required_backend()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for mode in [RecursiveMode::NonRecursive, RecursiveMode::Recursive] {
+            for fallback_first in [false, true] {
+                for drop_explicit_first in [false, true] {
+                    let fixture = tempfile::tempdir()?;
+                    let parent = fixture.path();
+                    let missing = parent.join("missing");
+                    let watcher = Arc::new(FileWatcher::new()?);
+                    let (direct, mut direct_rx) = watcher.add_subscriber();
+                    let (fallback, mut fallback_rx) = watcher.add_subscriber();
+                    let explicit =
+                        || direct.register_path(parent.into(), mode == RecursiveMode::Recursive);
+                    let unresolved =
+                        || fallback.register_path(missing.clone(), /*recursive*/ true);
+                    let (a, b) = if fallback_first {
+                        let b = unresolved();
+                        (explicit(), b)
+                    } else {
+                        (explicit(), unresolved())
+                    };
+                    assert!(a.registration_succeeded() && b.registration_succeeded());
+                    assert_eq!(backends(&watcher, parent), (false, Some(mode)));
+                    if drop_explicit_first {
+                        drop(a);
+                        assert_eq!(backends(&watcher, parent), (true, None));
+                        fs::create_dir(&missing)?;
+                        receive_path(&mut fallback_rx, &missing, "explicit subscriber dropped")
+                            .await;
+                        drop(b);
+                    } else {
+                        drop(b);
+                        assert_eq!(backends(&watcher, parent), (false, Some(mode)));
+                        let direct_child = parent.join("direct-child");
+                        fs::write(&direct_child, [])?;
+                        receive_path(&mut direct_rx, &direct_child, "fallback subscriber dropped")
+                            .await;
+                        drop(a);
+                    }
+                    assert_eq!(backends(&watcher, parent), (false, None));
+                    assert_eq!(backends(&watcher, &missing), (false, None));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn root_lifetime_can_watch_a_named_pipe_without_a_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let fifo = fixture.path().join("pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()?
+                .success()
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(vnode::Watch::new(vnode::Location::Root(fifo), tx).map(drop));
+        });
+        result.recv_timeout(Duration::from_secs(5))??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_replaced_ancestor_rearms_at_the_same_path() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = tempfile::tempdir()?;
+        let parent = fixture.path().join("parent");
+        let replacement = fixture.path().join("replacement");
+        fs::create_dir(&parent)?;
+        fs::create_dir(&replacement)?;
+        let requested = parent.join("missing");
+        let watcher = Arc::new(FileWatcher::new()?);
+        let (subscriber, mut rx) = watcher.add_subscriber();
+        let _registration = subscriber.register_path(requested.clone(), /*recursive*/ true);
+        fs::rename(&replacement, &parent)?;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let current = watcher
+                    .inner
+                    .as_ref()
+                    .expect("live watcher")
+                    .lock()
+                    .expect("watch lock")
+                    .ancestors
+                    .get(&parent)
+                    .is_some_and(|watch| watch.still_watches(&parent));
+                if current {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replacement vnode");
+        fs::create_dir(&requested)?;
+        receive_path(&mut rx, &requested, "ancestor rebound").await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_shared_fallback_rechecks_newly_registered_symlink_components()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        let home = root.join("home");
+        let external = root.join("external");
+        fs::create_dir(&home)?;
+        fs::create_dir_all(external.join("skills"))?;
+        let requested = WatchPath {
+            path: home.join("alias/skills"),
+            recursive: true,
+        };
+        let (actual, matched, fallback) = actual_watch_path(&requested);
+        symlink(&external, home.join("alias"))?;
+
+        let (tx, mut raw_rx) = mpsc::unbounded_channel();
+        let watcher = Arc::new(FileWatcher::with_event_sender(tx)?);
+        let (subscriber, mut rx) = watcher.add_subscriber();
+        let _other = subscriber.register_path(home.join("other"), /*recursive*/ true);
+        // The existing source was armed after the symlink appeared. Drain its
+        // registration and arming rechecks before inserting the stale resolution.
+        for _ in 0..2 {
+            assert!(
+                matches!(timeout(Duration::from_secs(5), raw_rx.recv()).await?,
+                Some(BackendEvent::VnodeChanged(vnode::Location::Ancestor(path))) if path == home)
+            );
+        }
+        watcher.spawn_event_loop(raw_rx);
+        assert!(watcher.register_paths(
+            subscriber.id,
+            &[SubscriberWatchRegistration {
+                key: SubscriberWatchKey {
+                    requested: requested.clone(),
+                    matched
+                },
+                actual,
+                fallback,
+            }]
+        ));
+        receive_path(&mut rx, &requested.path, "shared registration").await;
+        fs::write(external.join("skills/SKILL.md"), [])?;
+        receive_path(&mut rx, &requested.path.join("SKILL.md"), "symlinked child").await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn promoted_root_follows_replacement_of_a_symlink_component()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let home = fixture.path().join("home");
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        fs::create_dir(&home)?;
+        fs::create_dir_all(first.join("skills"))?;
+        fs::create_dir_all(second.join("skills"))?;
+        let link = home.join("alias");
+        let requested = link.join("skills");
+        let watcher = Arc::new(FileWatcher::new()?);
+        let (subscriber, mut rx) = watcher.add_subscriber();
+        let _registration = subscriber.register_path(requested.clone(), /*recursive*/ true);
+
+        let direct_root = first.join("skills");
+        let (direct, mut direct_rx) = watcher.add_subscriber();
+        let _direct = direct.register_path(direct_root.clone(), /*recursive*/ false);
+        symlink(&first, &link)?;
+        receive_path(&mut rx, &requested, "initial symlink").await;
+        fs::write(first.join("skills/before"), [])?;
+        receive_path(&mut rx, &requested.join("before"), "original target").await;
+
+        let replacement = fixture.path().join("replacement");
+        symlink(&second, &replacement)?;
+        fs::rename(&replacement, &link)?;
+        receive_path(&mut rx, &requested, "retarget symlink").await;
+        fs::write(second.join("skills/after"), [])?;
+        receive_path(&mut rx, &requested.join("after"), "new target").await;
+        let original_child = direct_root.join("still-watched");
+        fs::write(&original_child, [])?;
+        receive_path(&mut direct_rx, &original_child, "shared original target").await;
+
+        fs::remove_file(&link)?;
+        receive_path(&mut rx, &requested, "unlink symlink").await;
+        symlink(&first, &link)?;
+        receive_path(&mut rx, &requested, "recreate symlink").await;
+        fs::write(first.join("skills/recreated"), [])?;
+        receive_path(&mut rx, &requested.join("recreated"), "recreated target").await;
+        Ok(())
+    }
 }

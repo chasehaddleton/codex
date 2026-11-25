@@ -41,7 +41,39 @@ pub struct WatchPath {
     pub recursive: bool,
 }
 
+#[cfg(target_os = "macos")]
+mod vnode;
+
 type SubscriberId = u64;
+
+enum BackendEvent {
+    Native(notify::Result<Event>),
+    #[cfg(target_os = "macos")]
+    VnodeChanged(vnode::Location),
+    #[cfg(target_os = "macos")]
+    Vanished(PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchMode {
+    Native(RecursiveMode),
+    #[cfg(target_os = "macos")]
+    Ancestor,
+}
+
+impl WatchPath {
+    fn mode_for(&self, _requested: &WatchPath) -> WatchMode {
+        #[cfg(target_os = "macos")]
+        if self.path != _requested.path {
+            return WatchMode::Ancestor;
+        }
+        WatchMode::Native(if self.recursive {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        })
+    }
+}
 
 #[derive(Default)]
 struct WatchState {
@@ -69,6 +101,10 @@ struct SubscriberWatchKey {
 
 /// Mutable per-subscriber watch state.
 struct SubscriberWatchState {
+    /// A previously missing component can be created as a symlink to another
+    /// directory. Keep the registration key stable while matching its new target.
+    #[cfg(target_os = "macos")]
+    updated_match: Option<WatchPath>,
     /// Existing path passed to the OS watcher and used for ref-counting. This
     /// is usually `requested`, but missing targets use an existing ancestor.
     actual: WatchPath,
@@ -182,43 +218,126 @@ fn watch_channel() -> (WatchSender, Receiver) {
 struct PathWatchCounts {
     non_recursive: usize,
     recursive: usize,
+    #[cfg(target_os = "macos")]
+    ancestors: usize,
 }
 
 impl PathWatchCounts {
-    fn increment(&mut self, recursive: bool, amount: usize) {
-        if recursive {
-            self.recursive += amount;
-        } else {
-            self.non_recursive += amount;
+    fn count_mut(&mut self, mode: WatchMode) -> &mut usize {
+        match mode {
+            WatchMode::Native(RecursiveMode::Recursive) => &mut self.recursive,
+            WatchMode::Native(RecursiveMode::NonRecursive) => &mut self.non_recursive,
+            #[cfg(target_os = "macos")]
+            WatchMode::Ancestor => &mut self.ancestors,
         }
     }
 
-    fn decrement(&mut self, recursive: bool, amount: usize) {
-        if recursive {
-            self.recursive = self.recursive.saturating_sub(amount);
-        } else {
-            self.non_recursive = self.non_recursive.saturating_sub(amount);
-        }
+    fn increment(&mut self, mode: WatchMode, amount: usize) {
+        *self.count_mut(mode) += amount;
     }
 
-    fn effective_mode(self) -> Option<RecursiveMode> {
+    fn decrement(&mut self, mode: WatchMode, amount: usize) {
+        let count = self.count_mut(mode);
+        *count = count.saturating_sub(amount);
+    }
+
+    fn effective_mode(self) -> Option<WatchMode> {
         if self.recursive > 0 {
-            Some(RecursiveMode::Recursive)
-        } else if self.non_recursive > 0 {
-            Some(RecursiveMode::NonRecursive)
-        } else {
-            None
+            return Some(WatchMode::Native(RecursiveMode::Recursive));
         }
-    }
-
-    fn is_empty(self) -> bool {
-        self.non_recursive == 0 && self.recursive == 0
+        if self.non_recursive > 0 {
+            return Some(WatchMode::Native(RecursiveMode::NonRecursive));
+        }
+        #[cfg(target_os = "macos")]
+        if self.ancestors > 0 {
+            return Some(WatchMode::Ancestor);
+        }
+        None
     }
 }
 
 struct FileWatcherInner {
+    #[cfg(not(target_os = "macos"))]
     watcher: RecommendedWatcher,
+    #[cfg(target_os = "macos")]
+    watcher: MacNativeWatcher,
     watched_paths: HashMap<PathBuf, RecursiveMode>,
+    #[cfg(target_os = "macos")]
+    ancestors: HashMap<PathBuf, vnode::Watch>,
+    #[cfg(target_os = "macos")]
+    roots: HashMap<PathBuf, vnode::Watch>,
+    #[cfg(target_os = "macos")]
+    raw_tx: mpsc::UnboundedSender<BackendEvent>,
+}
+
+#[cfg(target_os = "macos")]
+struct MacNativeWatcher {
+    inner: RecommendedWatcher,
+    // A symlink can resolve elsewhere by the time notify is asked to unwatch it.
+    // Register canonical paths and retain the spelling owned by each caller.
+    bindings: HashMap<PathBuf, (PathBuf, RecursiveMode)>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacNativeWatcher {
+    fn mode(&self, target: &Path) -> Option<RecursiveMode> {
+        self.bindings
+            .values()
+            .filter(|(path, _)| path == target)
+            .map(|(_, mode)| *mode)
+            .max_by_key(|m| *m == RecursiveMode::Recursive)
+    }
+
+    fn set_mode(
+        &mut self,
+        target: &Path,
+        before: Option<RecursiveMode>,
+        after: Option<RecursiveMode>,
+    ) -> notify::Result<()> {
+        if before == after {
+            return Ok(());
+        }
+        if before.is_some() {
+            self.inner.unwatch(target)?;
+        }
+        if let Some(mode) = after
+            && let Err(err) = self.inner.watch(target, mode)
+        {
+            if let Some(previous) = before {
+                let _ = self.inner.watch(target, previous);
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        let target = path.canonicalize()?;
+        if let Some((previous, previous_mode)) = self.bindings.get(path) {
+            if *previous == target && *previous_mode == mode {
+                return Ok(());
+            }
+            self.unwatch(path)?;
+        }
+        let before = self.mode(&target);
+        let after = before
+            .filter(|m| *m == RecursiveMode::Recursive)
+            .unwrap_or(mode);
+        self.set_mode(&target, before, Some(after))?;
+        self.bindings.insert(path.to_owned(), (target, mode));
+        Ok(())
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        let Some((target, removed)) = self.bindings.remove(path) else {
+            return Ok(());
+        };
+        let after = self.mode(&target);
+        let before = after
+            .filter(|m| *m == RecursiveMode::Recursive)
+            .unwrap_or(removed);
+        self.set_mode(&target, Some(before), after)
+    }
 }
 
 /// Coalesces bursts of watch notifications and emits at most once per interval.
@@ -310,9 +429,8 @@ impl FileWatcherSubscriber {
             .into_iter()
             .map(|requested| {
                 let (actual, matched, fallback) = actual_watch_path(&requested);
-                let key = SubscriberWatchKey { requested, matched };
                 SubscriberWatchRegistration {
-                    key,
+                    key: SubscriberWatchKey { requested, matched },
                     actual,
                     fallback,
                 }
@@ -388,21 +506,37 @@ impl FileWatcher {
     /// on the current Tokio runtime.
     pub fn new() -> notify::Result<Self> {
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
-        let raw_tx_clone = raw_tx;
+        let file_watcher = Self::with_event_sender(raw_tx)?;
+        file_watcher.spawn_event_loop(raw_rx);
+        Ok(file_watcher)
+    }
+
+    fn with_event_sender(raw_tx: mpsc::UnboundedSender<BackendEvent>) -> notify::Result<Self> {
+        #[cfg(target_os = "macos")]
+        let ancestor_tx = raw_tx.clone();
         let watcher = notify::recommended_watcher(move |res| {
-            let _ = raw_tx_clone.send(res);
+            let _ = raw_tx.send(BackendEvent::Native(res));
         })?;
+        #[cfg(target_os = "macos")]
+        let watcher = MacNativeWatcher {
+            inner: watcher,
+            bindings: HashMap::new(),
+        };
         let inner = FileWatcherInner {
             watcher,
             watched_paths: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            ancestors: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            roots: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            raw_tx: ancestor_tx,
         };
         let state = Arc::new(RwLock::new(WatchState::default()));
-        let file_watcher = Self {
+        Ok(Self {
             inner: Some(Arc::new(Mutex::new(inner))),
             state,
-        };
-        file_watcher.spawn_event_loop(raw_rx);
-        Ok(file_watcher)
+        })
     }
 
     /// Creates an inert watcher that only supports test-driven synthetic
@@ -450,6 +584,8 @@ impl FileWatcher {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut inner_guard: Option<std::sync::MutexGuard<'_, FileWatcherInner>> = None;
 
+        #[cfg(target_os = "macos")]
+        let mut ancestors_to_recheck = BTreeSet::new();
         for registration in watched_paths {
             let actual = {
                 let Some(subscriber) = state.subscribers.get_mut(&subscriber_id) else {
@@ -461,8 +597,14 @@ impl FileWatcher {
                         entry.get().actual.clone()
                     }
                     std::collections::hash_map::Entry::Vacant(entry) => {
+                        #[cfg(target_os = "macos")]
+                        if registration.fallback {
+                            ancestors_to_recheck.insert(&registration.actual.path);
+                        }
                         entry.insert(SubscriberWatchState {
                             actual: registration.actual.clone(),
+                            #[cfg(target_os = "macos")]
+                            updated_match: None,
                             count: 1,
                             last_exists: registration.key.matched.path.exists(),
                             fallback: registration.fallback,
@@ -477,7 +619,10 @@ impl FileWatcher {
                 .entry(actual.path.clone())
                 .or_default();
             let previous_mode = counts.effective_mode();
-            counts.increment(actual.recursive, /*amount*/ 1);
+            counts.increment(
+                actual.mode_for(&registration.key.requested),
+                /*amount*/ 1,
+            );
             let next_mode = counts.effective_mode();
             if previous_mode != next_mode {
                 self.reconfigure_watch(&actual.path, next_mode, &mut inner_guard);
@@ -496,10 +641,26 @@ impl FileWatcher {
         let Some(subscriber) = state.subscribers.get(&subscriber_id) else {
             return false;
         };
+        #[cfg(target_os = "macos")]
+        for ancestor in ancestors_to_recheck {
+            // An existing source can have delivered the relevant directory change
+            // before this registration joined it. Reconcile once under the new state.
+            let _ = guard
+                .raw_tx
+                .send(BackendEvent::VnodeChanged(vnode::Location::Ancestor(
+                    ancestor.clone(),
+                )));
+        }
         watched_paths.iter().all(|registration| {
             let Some(watch) = subscriber.watched_paths.get(&registration.key) else {
                 return false;
             };
+            #[cfg(target_os = "macos")]
+            if watch.actual.mode_for(&registration.key.requested) == WatchMode::Ancestor
+                && guard.ancestors.contains_key(&watch.actual.path)
+            {
+                return true;
+            }
             match guard.watched_paths.get(&watch.actual.path) {
                 Some(RecursiveMode::Recursive) => true,
                 Some(RecursiveMode::NonRecursive) => !watch.actual.recursive,
@@ -537,9 +698,12 @@ impl FileWatcher {
                 continue;
             };
             let previous_mode = counts.effective_mode();
-            counts.decrement(actual.recursive, /*amount*/ 1);
+            counts.decrement(
+                actual.mode_for(&subscriber_watch.requested),
+                /*amount*/ 1,
+            );
             let next_mode = counts.effective_mode();
-            if counts.is_empty() {
+            if next_mode.is_none() {
                 state.path_ref_counts.remove(&actual.path);
             }
             if previous_mode != next_mode {
@@ -558,7 +722,7 @@ impl FileWatcher {
         };
 
         let mut inner_guard: Option<std::sync::MutexGuard<'_, FileWatcherInner>> = None;
-        for (_subscriber_watch, subscriber_watch_state) in subscriber.watched_paths {
+        for (subscriber_watch, subscriber_watch_state) in subscriber.watched_paths {
             let Some(path_counts) = state
                 .path_ref_counts
                 .get_mut(&subscriber_watch_state.actual.path)
@@ -567,11 +731,13 @@ impl FileWatcher {
             };
             let previous_mode = path_counts.effective_mode();
             path_counts.decrement(
-                subscriber_watch_state.actual.recursive,
+                subscriber_watch_state
+                    .actual
+                    .mode_for(&subscriber_watch.requested),
                 subscriber_watch_state.count,
             );
             let next_mode = path_counts.effective_mode();
-            if path_counts.is_empty() {
+            if next_mode.is_none() {
                 state
                     .path_ref_counts
                     .remove(&subscriber_watch_state.actual.path);
@@ -589,7 +755,7 @@ impl FileWatcher {
     fn reconfigure_watch<'a>(
         &'a self,
         path: &Path,
-        next_mode: Option<RecursiveMode>,
+        next_mode: Option<WatchMode>,
         inner_guard: &mut Option<std::sync::MutexGuard<'a, FileWatcherInner>>,
     ) {
         Self::reconfigure_watch_inner(self.inner.as_ref(), path, next_mode, inner_guard);
@@ -598,7 +764,7 @@ impl FileWatcher {
     fn reconfigure_watch_inner<'a>(
         inner: Option<&'a Arc<Mutex<FileWatcherInner>>>,
         path: &Path,
-        next_mode: Option<RecursiveMode>,
+        next_mode: Option<WatchMode>,
         inner_guard: &mut Option<std::sync::MutexGuard<'a, FileWatcherInner>>,
     ) {
         let Some(inner) = inner else {
@@ -614,8 +780,19 @@ impl FileWatcher {
             return;
         };
 
+        #[cfg(target_os = "macos")]
+        if !matches!(next_mode, Some(WatchMode::Native(_))) {
+            guard.roots.remove(path);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(ancestor) = guard.ancestors.get(path) {
+            if next_mode == Some(WatchMode::Ancestor) && ancestor.still_watches(path) {
+                return;
+            }
+            guard.ancestors.remove(path);
+        }
         let existing_mode = guard.watched_paths.get(path).copied();
-        if existing_mode == next_mode {
+        if existing_mode.map(WatchMode::Native) == next_mode {
             return;
         }
 
@@ -626,8 +803,22 @@ impl FileWatcher {
             guard.watched_paths.remove(path);
         }
 
-        let Some(next_mode) = next_mode else {
-            return;
+        let next_mode = match next_mode {
+            Some(WatchMode::Native(mode)) => mode,
+            #[cfg(target_os = "macos")]
+            Some(WatchMode::Ancestor) => {
+                match vnode::Watch::new(
+                    vnode::Location::Ancestor(path.to_owned()),
+                    guard.raw_tx.clone(),
+                ) {
+                    Ok(watch) => {
+                        guard.ancestors.insert(path.to_path_buf(), watch);
+                    }
+                    Err(err) => warn!("failed to watch directory {}: {err}", path.display()),
+                }
+                return;
+            }
+            None => return,
         };
         if !path.exists() {
             return;
@@ -644,6 +835,7 @@ impl FileWatcher {
         path_ref_counts: &mut HashMap<PathBuf, PathWatchCounts>,
         old_actual: WatchPath,
         new_actual: WatchPath,
+        requested: &WatchPath,
         count: usize,
         inner: Option<&'a Arc<Mutex<FileWatcherInner>>>,
         inner_guard: &mut Option<std::sync::MutexGuard<'a, FileWatcherInner>>,
@@ -654,9 +846,9 @@ impl FileWatcher {
 
         if let Some(counts) = path_ref_counts.get_mut(&old_actual.path) {
             let previous_mode = counts.effective_mode();
-            counts.decrement(old_actual.recursive, count);
+            counts.decrement(old_actual.mode_for(requested), count);
             let next_mode = counts.effective_mode();
-            if counts.is_empty() {
+            if next_mode.is_none() {
                 path_ref_counts.remove(&old_actual.path);
             }
             if previous_mode != next_mode {
@@ -666,23 +858,55 @@ impl FileWatcher {
 
         let counts = path_ref_counts.entry(new_actual.path.clone()).or_default();
         let previous_mode = counts.effective_mode();
-        counts.increment(new_actual.recursive, count);
+        counts.increment(new_actual.mode_for(requested), count);
         let next_mode = counts.effective_mode();
         if previous_mode != next_mode {
             Self::reconfigure_watch_inner(inner, &new_actual.path, next_mode, inner_guard);
+        }
+        #[cfg(target_os = "macos")]
+        if new_actual.path == requested.path
+            && let Some(inner) = inner
+        {
+            // An FSEvents stream rooted at a directory need not report the root
+            // disappearing. Keep one terminal-event vnode source for the lifetime
+            // of this shared root so its missing-path subscription can resume.
+            let guard = inner_guard.get_or_insert_with(|| {
+                inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+            Self::watch_root_lifetime(guard, &new_actual.path);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn watch_root_lifetime(inner: &mut FileWatcherInner, path: &Path) {
+        if inner
+            .roots
+            .get(path)
+            .is_some_and(|watch| watch.still_watches(path))
+        {
+            return;
+        }
+        inner.roots.remove(path);
+        match vnode::Watch::new(vnode::Location::Root(path.to_owned()), inner.raw_tx.clone()) {
+            Ok(watch) => {
+                inner.roots.insert(path.to_owned(), watch);
+            }
+            Err(err) => warn!("failed to watch lifetime of {}: {err}", path.display()),
         }
     }
 
     // Bridge `notify`'s callback-based events into the Tokio runtime and
     // notify the matching subscribers.
-    fn spawn_event_loop(&self, mut raw_rx: mpsc::UnboundedReceiver<notify::Result<Event>>) {
+    fn spawn_event_loop(&self, mut raw_rx: mpsc::UnboundedReceiver<BackendEvent>) {
         if let Ok(handle) = Handle::try_current() {
             let state = Arc::clone(&self.state);
             let inner = self.inner.as_ref().map(Arc::downgrade);
             handle.spawn(async move {
                 loop {
                     match raw_rx.recv().await {
-                        Some(Ok(event)) => {
+                        Some(BackendEvent::Native(Ok(event))) => {
                             if !is_mutating_event(&event) {
                                 continue;
                             }
@@ -690,9 +914,65 @@ impl FileWatcher {
                                 continue;
                             }
                             let inner = inner.as_ref().and_then(std::sync::Weak::upgrade);
-                            Self::notify_subscribers(&state, inner.as_ref(), &event.paths).await;
+                            Self::notify_subscribers(&state, inner.as_ref(), &event.paths, None)
+                                .await;
                         }
-                        Some(Err(err)) => {
+                        #[cfg(target_os = "macos")]
+                        Some(BackendEvent::VnodeChanged(vnode::Location::Ancestor(path))) => {
+                            let inner = inner.as_ref().and_then(std::sync::Weak::upgrade);
+                            Self::notify_subscribers(
+                                &state,
+                                inner.as_ref(),
+                                std::slice::from_ref(&path),
+                                Some(&path),
+                            )
+                            .await;
+                        }
+                        #[cfg(target_os = "macos")]
+                        Some(BackendEvent::VnodeChanged(vnode::Location::Root(path))) => {
+                            let Some(inner) = inner.as_ref().and_then(std::sync::Weak::upgrade)
+                            else {
+                                break;
+                            };
+                            {
+                                let mut guard = inner
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if guard
+                                    .roots
+                                    .get(&path)
+                                    .is_none_or(|watch| watch.still_watches(&path))
+                                {
+                                    continue;
+                                }
+                                if path.exists() {
+                                    if let Some(mode) = guard.watched_paths.get(&path).copied()
+                                        && let Err(err) = guard.watcher.watch(&path, mode)
+                                    {
+                                        warn!("failed to rebind {}: {err}", path.display());
+                                        if !guard.watcher.bindings.contains_key(&path) {
+                                            guard.watched_paths.remove(&path);
+                                        }
+                                    }
+                                    Self::watch_root_lifetime(&mut guard, &path);
+                                } else {
+                                    guard.roots.remove(&path);
+                                }
+                            }
+                            Self::notify_subscribers(
+                                &state,
+                                Some(&inner),
+                                std::slice::from_ref(&path),
+                                None,
+                            )
+                            .await;
+                        }
+                        #[cfg(target_os = "macos")]
+                        Some(BackendEvent::Vanished(path)) => {
+                            let inner = inner.as_ref().and_then(std::sync::Weak::upgrade);
+                            Self::notify_subscribers(&state, inner.as_ref(), &[path], None).await;
+                        }
+                        Some(BackendEvent::Native(Err(err))) => {
                             warn!("file watcher error: {err}");
                         }
                         None => break,
@@ -708,6 +988,7 @@ impl FileWatcher {
         state: &RwLock<WatchState>,
         inner: Option<&Arc<Mutex<FileWatcherInner>>>,
         event_paths: &[PathBuf],
+        changed_ancestor: Option<&Path>,
     ) {
         let subscribers_to_notify: Vec<(WatchSender, Vec<PathBuf>)> = {
             let mut state = state
@@ -721,6 +1002,14 @@ impl FileWatcher {
                 for event_path in event_paths {
                     for (subscriber_watch, subscriber_watch_state) in &mut subscriber.watched_paths
                     {
+                        // A vnode event names the directory, not its changed child. Only
+                        // registrations waiting on this ancestor need to resolve their path.
+                        if changed_ancestor.is_some_and(|ancestor| {
+                            subscriber_watch_state.actual.path != ancestor
+                                || subscriber_watch.requested.path == ancestor
+                        }) {
+                            continue;
+                        }
                         if let Some(path) = changed_path_for_event(
                             subscriber_watch,
                             subscriber_watch_state,
@@ -729,14 +1018,34 @@ impl FileWatcher {
                             changed_paths.push(path);
                         }
 
-                        let (new_actual, _new_matched, fallback) =
-                            actual_watch_path(&subscriber_watch.requested);
+                        let requested = &subscriber_watch.requested;
+                        let (new_actual, _matched, fallback) = actual_watch_path(requested);
+                        #[cfg(target_os = "macos")]
+                        {
+                            subscriber_watch_state.updated_match =
+                                (_matched != subscriber_watch.matched).then_some(_matched);
+                        }
                         subscriber_watch_state.fallback |= fallback;
                         if subscriber_watch_state.actual != new_actual {
+                            #[cfg(target_os = "macos")]
+                            if subscriber_watch_state.actual.path == requested.path
+                                || new_actual.path == requested.path
+                            {
+                                // A descendant event can be the first indication of root
+                                // removal or creation. Invalidate the root before switching
+                                // streams, which can discard its remaining events.
+                                changed_paths.push(requested.path.clone());
+                                subscriber_watch_state.last_exists = !fallback;
+                            }
                             let old_actual = subscriber_watch_state.actual.clone();
                             let count = subscriber_watch_state.count;
                             subscriber_watch_state.actual = new_actual.clone();
-                            actual_watch_moves.push((old_actual, new_actual, count));
+                            actual_watch_moves.push((
+                                old_actual,
+                                new_actual,
+                                requested.clone(),
+                                count,
+                            ));
                         }
                     }
                 }
@@ -746,17 +1055,35 @@ impl FileWatcher {
             }
 
             let mut inner_guard: Option<std::sync::MutexGuard<'_, FileWatcherInner>> = None;
-            for (old_actual, new_actual, count) in actual_watch_moves {
+            for (old_actual, new_actual, requested, count) in actual_watch_moves {
                 Self::apply_actual_watch_move(
                     &mut state.path_ref_counts,
                     old_actual,
                     new_actual,
+                    &requested,
                     count,
                     inner,
                     &mut inner_guard,
                 );
             }
 
+            #[cfg(target_os = "macos")]
+            if let Some(path) = changed_ancestor
+                && state
+                    .path_ref_counts
+                    .get(path)
+                    .and_then(|counts| counts.effective_mode())
+                    == Some(WatchMode::Ancestor)
+            {
+                // A directory can be replaced at the same pathname. Rebind if the
+                // open vnode no longer matches the directory used to resolve the target.
+                Self::reconfigure_watch_inner(
+                    inner,
+                    path,
+                    Some(WatchMode::Ancestor),
+                    &mut inner_guard,
+                );
+            }
             subscribers_to_notify
         };
 
@@ -767,14 +1094,11 @@ impl FileWatcher {
 
     #[cfg(test)]
     pub(crate) async fn send_paths_for_test(&self, paths: Vec<PathBuf>) {
-        Self::notify_subscribers(&self.state, self.inner.as_ref(), &paths).await;
+        Self::notify_subscribers(&self.state, self.inner.as_ref(), &paths, None).await;
     }
 
     #[cfg(test)]
-    pub(crate) fn spawn_event_loop_for_test(
-        &self,
-        raw_rx: mpsc::UnboundedReceiver<notify::Result<Event>>,
-    ) {
+    pub(crate) fn spawn_event_loop_for_test(&self, raw_rx: mpsc::UnboundedReceiver<BackendEvent>) {
         self.spawn_event_loop(raw_rx);
     }
 
@@ -784,10 +1108,12 @@ impl FileWatcher {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .path_ref_counts
-            .get(path)
-            .map(|counts| (counts.non_recursive, counts.recursive))
+        state.path_ref_counts.get(path).map(|counts| {
+            let non_recursive = counts.non_recursive;
+            #[cfg(target_os = "macos")]
+            let non_recursive = non_recursive + counts.ancestors;
+            (non_recursive, counts.recursive)
+        })
     }
 }
 
@@ -811,10 +1137,9 @@ fn dedupe_watched_paths(mut watched_paths: Vec<WatchPath>) -> Vec<WatchPath> {
 
 /// Returns the actual OS watch path and canonical match path for a request.
 ///
-/// Missing targets are watched non-recursively through the nearest existing
-/// directory ancestor. As path components appear, the actual watch is moved
-/// closer to the requested path so broad recursive ancestor watches are never
-/// needed.
+/// Missing targets use the nearest existing directory to discover the next
+/// component. On macOS a vnode source observes membership changes without
+/// subscribing to the ancestor's FSEvents subtree.
 fn actual_watch_path(requested: &WatchPath) -> (WatchPath, WatchPath, bool) {
     if requested.path.exists() {
         let matched_path = requested
@@ -861,70 +1186,42 @@ fn actual_watch_path(requested: &WatchPath) -> (WatchPath, WatchPath, bool) {
 /// backends, then falls back to the originally requested namespace for
 /// synthetic tests and backends that preserve the input spelling.
 fn changed_path_for_event(
-    subscriber_watch: &SubscriberWatchKey,
-    subscriber_watch_state: &mut SubscriberWatchState,
+    key: &SubscriberWatchKey,
+    state: &mut SubscriberWatchState,
     event_path: &Path,
 ) -> Option<PathBuf> {
-    if let Some(path) = changed_path_for_matched_path(
-        subscriber_watch,
-        subscriber_watch_state,
-        &subscriber_watch.matched,
-        event_path,
-    ) {
+    let requested = &key.requested;
+    let matched = &key.matched;
+    #[cfg(target_os = "macos")]
+    let matched = state.updated_match.as_ref().unwrap_or(matched);
+    let mut changed_in_namespace = |matched: &WatchPath| {
+        if event_path == matched.path {
+            state.last_exists = matched.path.exists();
+            return Some(requested.path.clone());
+        }
+        if matched.path.starts_with(event_path) {
+            let now_exists = matched.path.exists();
+            let previously_existed = std::mem::replace(&mut state.last_exists, now_exists);
+            if state.fallback || state.actual.path != matched.path {
+                return (now_exists || previously_existed).then(|| requested.path.clone());
+            }
+            return Some(event_path.to_path_buf());
+        }
+
+        let suffix = event_path.strip_prefix(&matched.path).ok()?;
+        if !matched.recursive && event_path.parent() != Some(matched.path.as_path()) {
+            return None;
+        }
+        state.last_exists = matched.path.exists();
+        Some(requested.path.join(suffix))
+    };
+    if let Some(path) = changed_in_namespace(matched) {
         return Some(path);
     }
-    if subscriber_watch.matched.path == subscriber_watch.requested.path {
+    if matched.path == requested.path {
         return None;
     }
-    changed_path_for_matched_path(
-        subscriber_watch,
-        subscriber_watch_state,
-        &subscriber_watch.requested,
-        event_path,
-    )
-}
-
-/// Applies the watch matching rules in one path namespace and maps any emitted
-/// path back into the subscriber's requested namespace.
-fn changed_path_for_matched_path(
-    subscriber_watch: &SubscriberWatchKey,
-    subscriber_watch_state: &mut SubscriberWatchState,
-    matched: &WatchPath,
-    event_path: &Path,
-) -> Option<PathBuf> {
-    let requested = &subscriber_watch.requested;
-    if event_path == matched.path {
-        subscriber_watch_state.last_exists = matched.path.exists();
-        return Some(requested.path.clone());
-    }
-    if matched.path.starts_with(event_path) {
-        let now_exists = matched.path.exists();
-        if subscriber_watch_state.fallback {
-            let should_notify = now_exists || subscriber_watch_state.last_exists;
-            subscriber_watch_state.last_exists = now_exists;
-            return should_notify.then(|| requested.path.clone());
-        }
-        if subscriber_watch_state.actual.path != matched.path {
-            let should_notify = now_exists || subscriber_watch_state.last_exists;
-            subscriber_watch_state.last_exists = now_exists;
-            return should_notify.then(|| requested.path.clone());
-        }
-        subscriber_watch_state.last_exists = now_exists;
-        return Some(event_path.to_path_buf());
-    }
-    if !event_path.starts_with(&matched.path) {
-        return None;
-    }
-    if !(matched.recursive || event_path.parent() == Some(matched.path.as_path())) {
-        return None;
-    }
-    subscriber_watch_state.last_exists = matched.path.exists();
-    Some(
-        event_path
-            .strip_prefix(&matched.path)
-            .map(|suffix| requested.path.join(suffix))
-            .unwrap_or_else(|_| event_path.to_path_buf()),
-    )
+    changed_in_namespace(requested)
 }
 
 #[cfg(test)]
